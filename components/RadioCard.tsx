@@ -25,98 +25,211 @@ export default function RadioCard({
   const audioRef = useRef<HTMLAudioElement>(null);
   const [isPlaying, setIsPlaying] = useState(false);
 
+  const audioCtxRef = useRef<AudioContext | null>(null);
+  const mediaRecorderRef = useRef<MediaRecorder | null>(null);
+  const socketRef = useRef<WebSocket | null>(null);
+  const [subtitle, setSubtitle] = useState("");
+
+  const setupDeepgram = () => {
+    if (!audioRef.current) return;
+
+    try {
+      // 1. Setup Web Audio API to capture the audio stream
+      if (!audioCtxRef.current) {
+        const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
+        audioCtxRef.current = new AudioContextClass();
+        const source = audioCtxRef.current.createMediaElementSource(audioRef.current);
+        const dest = audioCtxRef.current.createMediaStreamDestination();
+        
+        // Connect source to destination (for recording) AND to hardware output (to hear it)
+        source.connect(dest);
+        source.connect(audioCtxRef.current.destination);
+        
+        mediaRecorderRef.current = new MediaRecorder(dest.stream, { mimeType: 'audio/webm' });
+      }
+
+      // 2. Setup Deepgram WebSocket
+      const apiKey = process.env.NEXT_PUBLIC_DEEPGRAM_API_KEY;
+      if (!apiKey) {
+        console.error("Deepgram API key missing");
+        return;
+      }
+
+      const socket = new WebSocket('wss://api.deepgram.com/v1/listen?model=nova-2&smart_format=true', [
+        'token',
+        apiKey,
+      ]);
+      socketRef.current = socket;
+
+      socket.onopen = () => {
+        console.log("Deepgram connected");
+        if (mediaRecorderRef.current && mediaRecorderRef.current.state === 'inactive') {
+          mediaRecorderRef.current.ondataavailable = (event) => {
+            if (event.data.size > 0 && socket.readyState === WebSocket.OPEN) {
+              socket.send(event.data);
+            }
+          };
+          mediaRecorderRef.current.start(250); // Send audio chunks every 250ms
+        }
+      };
+
+      socket.onmessage = (message) => {
+        const received = JSON.parse(message.data);
+        const transcript = received.channel?.alternatives[0]?.transcript;
+        if (transcript) {
+          setSubtitle(transcript);
+        }
+      };
+
+      socket.onerror = (error) => {
+        console.error("Deepgram WebSocket Error:", error);
+      };
+
+    } catch (err) {
+      console.error("Failed to setup audio capture:", err);
+    }
+  };
+
+  const stopDeepgram = () => {
+    if (mediaRecorderRef.current && mediaRecorderRef.current.state !== 'inactive') {
+      mediaRecorderRef.current.stop();
+    }
+    if (socketRef.current) {
+      socketRef.current.close();
+      socketRef.current = null;
+    }
+    setSubtitle("");
+  };
+
   const handlePlayClick = () => {
     if (!isOnline || !audioRef.current) return;
+    
+    // Resume audio context if it was suspended (browser policy)
+    if (audioCtxRef.current?.state === 'suspended') {
+      audioCtxRef.current.resume();
+    }
+
     onPlayRequest(audioRef.current);
-    audioRef.current.play();
-    setIsPlaying(true);
+    audioRef.current.play().then(() => {
+      setIsPlaying(true);
+      setupDeepgram();
+    }).catch(e => console.error("Play error:", e));
   };
 
   const handlePauseClick = () => {
     if (audioRef.current) {
       audioRef.current.pause();
       setIsPlaying(false);
+      stopDeepgram();
     }
   };
 
   useEffect(() => {
     if (!isActive && isPlaying) {
       audioRef.current?.pause();
-      audioRef.current!.currentTime = 0;
+      if (audioRef.current) audioRef.current.currentTime = 0;
       setIsPlaying(false);
+      stopDeepgram();
     }
-  }, [isActive]);
+  }, [isActive, isPlaying]);
+
+  // Use proxy to bypass CORS on the audio stream so we can extract PCM data
+  const proxyUrl = `/api/proxy?url=${encodeURIComponent(url)}`;
 
   return (
-    <div
-      className={`relative rounded-[2rem] p-[1px] transition-all transform duration-500 hover:-translate-y-2 hover:shadow-2xl overflow-hidden group ${
-        isOnline ? 'bg-gradient-to-br from-teal-400/50 to-emerald-600/50 hover:from-teal-300 hover:to-emerald-500' : 'bg-white/10'
-      }`}
-    >
-      <div className="h-full w-full rounded-[2rem] bg-white/5 backdrop-blur-xl border border-white/10 p-6 flex flex-col justify-between relative z-10">
-        
-        {/* Glow effect on hover */}
-        <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none rounded-[2rem]" />
-        
-        <div>
-          <div className="flex justify-between items-start mb-4">
-            <h2 className="text-2xl font-bold text-white drop-shadow-sm">{name}</h2>
-            <div
-              className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold backdrop-blur-md shadow-inner ${
-                isOnline
-                  ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
-                  : 'bg-red-500/20 text-red-300 border border-red-500/30'
-              }`}
-            >
-              <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`}></span>
-              {isOnline ? 'Live' : 'Offline'}
+    <>
+      <div
+        className={`relative rounded-[2rem] p-[1px] transition-all transform duration-500 hover:-translate-y-2 hover:shadow-2xl overflow-hidden group ${
+          isOnline ? 'bg-gradient-to-br from-teal-400/50 to-emerald-600/50 hover:from-teal-300 hover:to-emerald-500' : 'bg-white/10'
+        }`}
+      >
+        <div className="h-full w-full rounded-[2rem] bg-white/5 backdrop-blur-xl border border-white/10 p-6 flex flex-col justify-between relative z-10">
+          
+          <div className="absolute inset-0 bg-gradient-to-br from-white/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity duration-500 pointer-events-none rounded-[2rem]" />
+          
+          <div>
+            <div className="flex justify-between items-start mb-4">
+              <h2 className="text-2xl font-bold text-white drop-shadow-sm">{name}</h2>
+              <div
+                className={`flex items-center gap-1.5 px-3 py-1 rounded-full text-xs font-semibold backdrop-blur-md shadow-inner ${
+                  isOnline
+                    ? 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/30'
+                    : 'bg-red-500/20 text-red-300 border border-red-500/30'
+                }`}
+              >
+                <span className={`w-2 h-2 rounded-full ${isOnline ? 'bg-emerald-400 animate-pulse' : 'bg-red-400'}`}></span>
+                {isOnline ? 'Live' : 'Offline'}
+              </div>
             </div>
+            <p className="text-gray-300 text-sm font-medium mb-6 flex items-center gap-2">
+              <svg width="16" height="16" className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"></path></svg>
+              {detail}
+            </p>
           </div>
-          <p className="text-gray-300 text-sm font-medium mb-6 flex items-center gap-2">
-            <svg width="16" height="16" className="w-4 h-4 text-emerald-400" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M9 19V6l12-3v13M9 19c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zm12-3c0 1.105-1.343 2-3 2s-3-.895-3-2 1.343-2 3-2 3 .895 3 2zM9 10l12-3"></path></svg>
-            {detail}
-          </p>
-        </div>
 
-        <audio ref={audioRef} src={isOnline ? url : ''} preload="none" />
+          <audio ref={audioRef} crossOrigin="anonymous" src={isOnline ? proxyUrl : ''} preload="none" />
 
-        <div className="flex items-center justify-between mt-auto pt-4 border-t border-white/10">
-          {isOnline ? (
+          <div className="flex items-center justify-between mt-auto pt-4 border-t border-white/10">
+            {isOnline ? (
+              <button
+                onClick={isPlaying ? handlePauseClick : handlePlayClick}
+                className={`w-14 h-14 flex items-center justify-center rounded-full transition-all duration-300 hover:scale-110 focus:outline-none shadow-lg ${
+                  isPlaying
+                    ? 'bg-gradient-to-r from-amber-400 to-orange-500 text-white animate-pulse'
+                    : 'bg-gradient-to-r from-teal-400 to-emerald-500 text-white'
+                }`}
+              >
+                {isPlaying ? (
+                  <svg width="24" height="24" className="w-6 h-6 fill-current" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
+                ) : (
+                  <svg width="24" height="24" className="w-6 h-6 fill-current ml-1" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
+                )}
+              </button>
+            ) : (
+              <div className="w-14 h-14 flex items-center justify-center rounded-full bg-white/5 border border-white/10">
+                <svg width="24" height="24" className="w-6 h-6 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 5.636l-3.536 3.536m0 5.656l3.536 3.536M9.172 9.172L5.636 5.636m3.536 9.192l-3.536 3.536M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-5 0a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
+              </div>
+            )}
+
             <button
-              onClick={isPlaying ? handlePauseClick : handlePlayClick}
-              className={`w-14 h-14 flex items-center justify-center rounded-full transition-all duration-300 hover:scale-110 focus:outline-none shadow-lg ${
-                isPlaying
-                  ? 'bg-gradient-to-r from-amber-400 to-orange-500 text-white animate-pulse'
-                  : 'bg-gradient-to-r from-teal-400 to-emerald-500 text-white'
+              onClick={() => toggleFavorite(id)}
+              className={`p-3 rounded-full transition duration-300 backdrop-blur-md ${
+                isFavorite
+                  ? 'bg-rose-500/20 text-rose-400 border border-rose-500/50 hover:bg-rose-500/30'
+                  : 'bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 hover:text-white'
               }`}
+              title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
             >
-              {isPlaying ? (
-                <svg width="24" height="24" className="w-6 h-6 fill-current" viewBox="0 0 24 24"><path d="M6 19h4V5H6v14zm8-14v14h4V5h-4z"/></svg>
-              ) : (
-                <svg width="24" height="24" className="w-6 h-6 fill-current ml-1" viewBox="0 0 24 24"><path d="M8 5v14l11-7z"/></svg>
-              )}
+              <svg width="24" height="24" className={`w-6 h-6 ${isFavorite ? 'fill-current' : 'fill-none'}`} stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path>
+              </svg>
             </button>
-          ) : (
-            <div className="w-14 h-14 flex items-center justify-center rounded-full bg-white/5 border border-white/10">
-              <svg width="24" height="24" className="w-6 h-6 text-gray-500" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M18.364 5.636l-3.536 3.536m0 5.656l3.536 3.536M9.172 9.172L5.636 5.636m3.536 9.192l-3.536 3.536M21 12a9 9 0 11-18 0 9 9 0 0118 0zm-5 0a4 4 0 11-8 0 4 4 0 018 0z"></path></svg>
-            </div>
-          )}
-
-          <button
-            onClick={() => toggleFavorite(id)}
-            className={`p-3 rounded-full transition duration-300 backdrop-blur-md ${
-              isFavorite
-                ? 'bg-rose-500/20 text-rose-400 border border-rose-500/50 hover:bg-rose-500/30'
-                : 'bg-white/5 text-gray-300 border border-white/10 hover:bg-white/10 hover:text-white'
-            }`}
-            title={isFavorite ? 'Remove from favorites' : 'Add to favorites'}
-          >
-            <svg width="24" height="24" className={`w-6 h-6 ${isFavorite ? 'fill-current' : 'fill-none'}`} stroke="currentColor" viewBox="0 0 24 24">
-              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M4.318 6.318a4.5 4.5 0 000 6.364L12 20.364l7.682-7.682a4.5 4.5 0 00-6.364-6.364L12 7.636l-1.318-1.318a4.5 4.5 0 00-6.364 0z"></path>
-            </svg>
-          </button>
+          </div>
         </div>
       </div>
-    </div>
+
+      {/* Beautiful Floating Subtitles UI */}
+      {isPlaying && subtitle && (
+        <div className="fixed bottom-10 left-1/2 transform -translate-x-1/2 z-50 w-11/12 max-w-4xl animate-fade-in-up">
+          <div className="bg-black/40 backdrop-blur-2xl border border-white/20 p-6 rounded-3xl shadow-2xl flex items-start gap-4">
+            <div className="w-12 h-12 rounded-full bg-gradient-to-br from-teal-400 to-emerald-500 flex items-center justify-center shrink-0 shadow-lg animate-pulse">
+              <svg className="w-6 h-6 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth="2" d="M8 10h.01M12 10h.01M16 10h.01M9 16H5a2 2 0 01-2-2V6a2 2 0 012-2h14a2 2 0 012 2v8a2 2 0 01-2 2h-5l-5 5v-5z"></path></svg>
+            </div>
+            <div className="flex-1">
+              <div className="flex items-center gap-2 mb-1">
+                <span className="text-emerald-400 text-sm font-bold tracking-wider uppercase">Live AI Subtitles</span>
+                <span className="flex h-2 w-2 relative">
+                  <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-emerald-400 opacity-75"></span>
+                  <span className="relative inline-flex rounded-full h-2 w-2 bg-emerald-500"></span>
+                </span>
+              </div>
+              <p className="text-white text-xl md:text-2xl font-medium leading-relaxed drop-shadow-md">
+                "{subtitle}"
+              </p>
+            </div>
+          </div>
+        </div>
+      )}
+    </>
   );
 }
